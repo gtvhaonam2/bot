@@ -1,35 +1,70 @@
 import os
-import requests
 import json
 import urllib.request
 from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
+from flask import Flask
+import threading
 
-TOKEN = os.environ.get("TELEGRAM_TOKEN", "8661640585:AAFkGTh4Ose1dZXti2J7vVfQvTueWagzYKU")
+TOKEN = os.environ.get("8661640585:AAFkGTh4Ose1dZXti2J7vVfQvTueWagzYKU")
 
-# ===== GIÁ =====
+# ===== PHẦN GIỮ CỔNG WEB CHO RENDER =====
+app_web = Flask(__name__)
+
+@app_web.route('/')
+def health():
+    return "Bot is running!"
+
+def run_web():
+    port = int(os.environ.get("PORT", 8080))
+    app_web.run(host="0.0.0.0", port=port)
+
+# ===== LẤY GIÁ TỪ COINBASE (Không bị chặn) =====
 def get_price(symbol):
     try:
-        url = f"https://api.binance.com/api/v3/ticker/24hr?symbol={symbol}USDT"
-        with urllib.request.urlopen(url, timeout=10) as r:
+        # 1. Lấy giá hiện tại
+        url_ticker = f"https://api.exchange.coinbase.com/products/{symbol}-USD/ticker"
+        req = urllib.request.Request(url_ticker, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=10) as r:
             d = json.loads(r.read())
-        return {"price": float(d["lastPrice"]), "change": float(d["priceChangePercent"]),
-                "high": float(d["highPrice"]), "low": float(d["lowPrice"]),
-                "volume": float(d["quoteVolume"])}
-    except: return None
+            price = float(d["price"])
+        
+        # 2. Lấy thống kê 24h (High, Low, Volume)
+        url_stats = f"https://api.exchange.coinbase.com/products/{symbol}-USD/stats"
+        req_stats = urllib.request.Request(url_stats, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req_stats, timeout=10) as r:
+            s = json.loads(r.read())
+            high = float(s["high"])
+            low = float(s["low"])
+            volume = float(s["volume"]) * price
+            open_price = float(s["open"])
+            change = ((price - open_price) / open_price) * 100
 
-# ===== RSI =====
+        return {"price": price, "change": change, "high": high, "low": low, "volume": volume}
+    except Exception as e:
+        return None
+
+# ===== RSI (Dùng nến Coinbase) =====
 def get_rsi(symbol, interval="1h"):
     try:
-        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}USDT&interval={interval}&limit=100"
-        with urllib.request.urlopen(url, timeout=10) as r:
+        # Lấy 100 nến 1h
+        url = f"https://api.exchange.coinbase.com/products/{symbol}-USD/candles?granularity=3600"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=10) as r:
             data = json.loads(r.read())
+        
+        # Coinbase trả về mảng [time, low, high, open, close, volume]
+        # Sắp xếp lại theo thời gian tăng dần
+        data = sorted(data, key=lambda x: x[0])
         closes = [float(k[4]) for k in data]
+        
         gains, losses = [], []
         for i in range(1, len(closes)):
             diff = closes[i] - closes[i-1]
             gains.append(max(diff, 0)); losses.append(max(-diff, 0))
+            
+        # Tính RSI 14 phiên
         ag = sum(gains[-14:])/14; al = sum(losses[-14:])/14
         if al == 0: return 100
         return round(100 - (100/(1 + ag/al)), 1)
@@ -38,7 +73,7 @@ def get_rsi(symbol, interval="1h"):
 # ===== PHÂN TÍCH =====
 def analyze(symbol):
     p = get_price(symbol)
-    if not p: return "❌ Không lấy được dữ liệu."
+    if not p: return "❌ Không lấy được dữ liệu từ Coinbase. Vui lòng thử lại sau."
     rsi = get_rsi(symbol); price = p["price"]
     
     if rsi and rsi < 35:
@@ -53,10 +88,10 @@ def analyze(symbol):
     
     return f"""📊 *{symbol}* — {sig}
 
-💰 Giá: `{price:,.2f}` USDT
+💰 Giá: `{price:,.2f}` USD
 📈 24h: `{p['change']:+.2f}%`
 🔺 High: `{p['high']:,.2f}` | 🔻 Low: `{p['low']:,.2f}`
-📊 Volume: `${p['volume']/1e6:.1f}M`
+📊 Volume 24h: `${p['volume']/1e6:.1f}M`
 💡 RSI(1h): `{rsi if rsi else 'N/A'}`
 
 ━━━━━━━━━━━━━━
@@ -94,6 +129,7 @@ async def price(update: Update, ctx):
 
 # ===== MAIN =====
 def main():
+    threading.Thread(target=run_web, daemon=True).start()
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("btc", btc))
