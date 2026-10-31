@@ -1,142 +1,101 @@
 import os
-import json
-import urllib.request
-from datetime import datetime
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
-from flask import Flask
-import threading
+import sqlite3
+import requests
+from fastapi import FastAPI, Request, BackgroundTasks
+from pydantic import BaseModel
+from typing import Optional
+import uvicorn
 
-TOKEN = os.environ.get("8661640585:AAFkGTh4Ose1dZXti2J7vVfQvTueWagzYKU")
+# LẤY TOKEN TỪ BIẾN MÔI TRƯỜNG (Sẽ điền ở Bước 3)
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8661640585:AAFkGTh4Ose1dZXti2J7vVfQvTueWagzYKU")
+TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# ===== PHẦN GIỮ CỔNG WEB CHO RENDER =====
-app_web = Flask(__name__)
+app = FastAPI()
 
-@app_web.route('/')
-def health():
-    return "Bot is running!"
+def init_db():
+    conn = sqlite3.connect("users.db")
+    cursor = conn.cursor()
+    cursor.execute('''CREATE TABLE IF NOT EXISTS users (chat_id INTEGER PRIMARY KEY, subscribed INTEGER DEFAULT 1)''')
+    conn.commit()
+    conn.close()
 
-def run_web():
-    port = int(os.environ.get("PORT", 8080))
-    app_web.run(host="0.0.0.0", port=port)
+init_db()
 
-# ===== LẤY GIÁ TỪ COINBASE (Không bị chặn) =====
-def get_price(symbol):
+def send_telegram(chat_id, text):
+    url = f"{TELEGRAM_API}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
     try:
-        # 1. Lấy giá hiện tại
-        url_ticker = f"https://api.exchange.coinbase.com/products/{symbol}-USD/ticker"
-        req = urllib.request.Request(url_ticker, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req, timeout=10) as r:
-            d = json.loads(r.read())
-            price = float(d["price"])
-        
-        # 2. Lấy thống kê 24h (High, Low, Volume)
-        url_stats = f"https://api.exchange.coinbase.com/products/{symbol}-USD/stats"
-        req_stats = urllib.request.Request(url_stats, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req_stats, timeout=10) as r:
-            s = json.loads(r.read())
-            high = float(s["high"])
-            low = float(s["low"])
-            volume = float(s["volume"]) * price
-            open_price = float(s["open"])
-            change = ((price - open_price) / open_price) * 100
+        requests.post(url, json=payload, timeout=5)
+    except Exception:
+        pass
 
-        return {"price": price, "change": change, "high": high, "low": low, "volume": volume}
-    except Exception as e:
-        return None
+@app.get("/")
+def read_root():
+    return {"status": "Bot đang chạy!"}
 
-# ===== RSI (Dùng nến Coinbase) =====
-def get_rsi(symbol, interval="1h"):
-    try:
-        # Lấy 100 nến 1h
-        url = f"https://api.exchange.coinbase.com/products/{symbol}-USD/candles?granularity=3600"
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req, timeout=10) as r:
-            data = json.loads(r.read())
+# NHẬN LỆNH TỪ TELEGRAM
+@app.get("/telegram_webhook")
+def telegram_webhook(update: dict):
+    if "message" in update:
+        chat_id = update["message"]["chat"]["id"]
+        text = update["message"].get("text", "")
         
-        # Coinbase trả về mảng [time, low, high, open, close, volume]
-        # Sắp xếp lại theo thời gian tăng dần
-        data = sorted(data, key=lambda x: x[0])
-        closes = [float(k[4]) for k in data]
-        
-        gains, losses = [], []
-        for i in range(1, len(closes)):
-            diff = closes[i] - closes[i-1]
-            gains.append(max(diff, 0)); losses.append(max(-diff, 0))
-            
-        # Tính RSI 14 phiên
-        ag = sum(gains[-14:])/14; al = sum(losses[-14:])/14
-        if al == 0: return 100
-        return round(100 - (100/(1 + ag/al)), 1)
-    except: return None
+        conn = sqlite3.connect("users.db")
+        cursor = conn.cursor()
 
-# ===== PHÂN TÍCH =====
-def analyze(symbol):
-    p = get_price(symbol)
-    if not p: return "❌ Không lấy được dữ liệu từ Coinbase. Vui lòng thử lại sau."
-    rsi = get_rsi(symbol); price = p["price"]
+        if text == "/start":
+            cursor.execute("INSERT OR REPLACE INTO users (chat_id, subscribed) VALUES (?, 1)", (chat_id,))
+            conn.commit()
+            send_telegram(chat_id, "✅ Bạn đã đăng ký nhận tín hiệu XAUUSD thành công!\nGõ /stop để hủy.")
+        elif text == "/stop":
+            cursor.execute("UPDATE users SET subscribed = 0 WHERE chat_id = ?", (chat_id,))
+            conn.commit()
+            send_telegram(chat_id, "🔕 Đã hủy đăng ký.")
+        conn.close()
+    return {"ok": True}
+
+# NHẬN TÍN HIỆU TỪ TRADINGVIEW & BẮN TELEGRAM
+def broadcast_signal(msg):
+    conn = sqlite3.connect("users.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT chat_id FROM users WHERE subscribed = 1")
+    users = cursor.fetchall()
+    conn.close()
+    for user in users:
+        send_telegram(user[0], msg)
+
+@app.post("/webhook")
+async def tradingview_webhook(request: Request, background_tasks: BackgroundTasks):
+    data = await request.json()
+    event = data.get("event")
+    symbol = data.get("symbol", "XAUUSD")
+    direction = data.get("direction")
+    entry, sl, tp1, tp2, tp3 = data.get("entry"), data.get("sl"), data.get("tp1"), data.get("tp2"), data.get("tp3")
+    score = data.get("score", 0)
+    order_type = data.get("order_type", "MARKET")
     
-    if rsi and rsi < 35:
-        sig = "🟢 LONG (oversold)"; entry = price
-        sl = round(price*0.97,2); tp1 = round(price*1.03,2); tp2 = round(price*1.05,2)
-    elif rsi and rsi > 65:
-        sig = "🔴 SHORT (overbought)"; entry = price
-        sl = round(price*1.03,2); tp1 = round(price*0.97,2); tp2 = round(price*0.95,2)
-    else:
-        sig = "⚪ CHỜ (trung tính)"; entry = price
-        sl = round(price*0.98,2); tp1 = round(price*1.02,2); tp2 = round(price*1.04,2)
-    
-    return f"""📊 *{symbol}* — {sig}
+    msg = ""
+    if event == "ENTRY":
+        emoji = "🟢" if direction == "BUY" else "🔴"
+        msg = f"{emoji} <b>{symbol} {direction} (MARKET)</b>\n\n📍 Entry: {entry}\n🛑 SL: {sl}\n🎯 TP1: {tp1}\n🎯 TP2: {tp2}\n🎯 TP3: {tp3}\n\n📊 Score: {score}/100"
+    elif event == "NEW_LIMIT":
+        emoji = "⏳"
+        msg = f"{emoji} <b>{symbol} {direction} LIMIT (Dự đoán)</b>\n\n📍 Giá chờ: {entry}\n🛑 SL: {sl}\n🎯 TP1: {tp1}\n🎯 TP2: {tp2}\n🎯 TP3: {tp3}"
+    elif event == "LIMIT_TRIGGERED":
+        msg = f"⚡️ <b>ĐÃ KHỚP LỆNH LIMIT!</b>\n\n{symbol} {direction} tại giá {entry}"
+    elif event == "UPDATE":
+        status = data.get("status")
+        status_text = "Chạm TP/SL"
+        if status == "TP1_HIT": status_text = "🎯 ĐÃ CHẠM TP1"
+        elif status == "TP2_HIT": status_text = "🎯 ĐÃ CHẠM TP2"
+        elif status == "TP3_HIT": status_text = "🏆 ĐÃ CHẠM TP3"
+        elif status == "SL_HIT": status_text = "🛑 ĐÃ CHẠM STOPLOSS"
+        msg = f"{status_text}\n\nLệnh: <b>{symbol} {direction}</b> ({order_type})"
 
-💰 Giá: `{price:,.2f}` USD
-📈 24h: `{p['change']:+.2f}%`
-🔺 High: `{p['high']:,.2f}` | 🔻 Low: `{p['low']:,.2f}`
-📊 Volume 24h: `${p['volume']/1e6:.1f}M`
-💡 RSI(1h): `{rsi if rsi else 'N/A'}`
-
-━━━━━━━━━━━━━━
-🎯 *KẾ HOẠCH THAM KHẢO*
-• Entry: `{entry:,.2f}`
-• SL: `{sl:,.2f}`
-• TP1: `{tp1:,.2f}`
-• TP2: `{tp2:,.2f}`
-
-⚠️ Chỉ tham khảo, không phải lời khuyên đầu tư.
-🕐 {datetime.now().strftime('%H:%M %d/%m/%Y')}"""
-
-# ===== HANDLERS =====
-async def start(update: Update, ctx):
-    await update.message.reply_text(
-        "🤖 *Bot Crypto*\n/btc — Phân tích BTC\n/eth — Phân tích ETH\n/both — Cả hai\n/price — Giá nhanh",
-        parse_mode="Markdown")
-
-async def btc(update: Update, ctx):
-    await update.message.reply_text(analyze("BTC"), parse_mode="Markdown")
-
-async def eth(update: Update, ctx):
-    await update.message.reply_text(analyze("ETH"), parse_mode="Markdown")
-
-async def both(update: Update, ctx):
-    await update.message.reply_text(analyze("BTC"), parse_mode="Markdown")
-    await update.message.reply_text(analyze("ETH"), parse_mode="Markdown")
-
-async def price(update: Update, ctx):
-    b = get_price("BTC"); e = get_price("ETH")
-    msg = "⚡ *Giá nhanh*\n\n"
-    if b: msg += f"₿ BTC: `${b['price']:,.2f}` ({b['change']:+.2f}%)\n"
-    if e: msg += f"Ξ ETH: `${e['price']:,.2f}` ({e['change']:+.2f}%)\n"
-    await update.message.reply_text(msg, parse_mode="Markdown")
-
-# ===== MAIN =====
-def main():
-    threading.Thread(target=run_web, daemon=True).start()
-    app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("btc", btc))
-    app.add_handler(CommandHandler("eth", eth))
-    app.add_handler(CommandHandler("both", both))
-    app.add_handler(CommandHandler("price", price))
-    app.run_polling()
+    if msg:
+        background_tasks.add_task(broadcast_signal, msg)
+    return {"status": "success"}
 
 if __name__ == "__main__":
-    main()
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
